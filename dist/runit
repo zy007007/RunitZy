@@ -1,0 +1,235 @@
+#!/bin/bash
+
+set -o pipefail		#表示在管道连接的命令序列中，只要有任何一个命令返回非0值，则整个管道返回非0值，即使最后一个命令返回0.
+
+# 常量
+SPORT=8080
+COLOR_ARRAY=('32' '33' '34' '35' '36')
+NUMBER=0
+
+# 变量
+procfile=""
+envfile=""
+
+#####################################
+#runit 用法说明
+#无参数
+#####################################
+
+function usage() {
+    echo "Usage: runit [-c] [-f procfile|Procfile] [-e envfile|.env]
+             -c: check procfile and envfile
+             -f: load the procfile
+             -e: load the envfile
+             -h: help information
+             "
+}
+
+#####################################
+#验证 envfile
+#参数 envfile 文件名
+#成功返回 0，错误返回 1
+#####################################
+
+function verify_env() {
+    local env_file="$1"		#局部变量
+    local ret_val=0
+
+    [[ ! -f "${env_file}" ]] && my_err "verify envfile not exists" && return 1  #判断${env_file}是否存在，如果不存在，输出 "not exists"，返回 1
+    while read nextline; do		#读取一行数据
+        if echo "${nextline}" | grep -v "="; then     #如果显示出，不包括 = 的行
+            my_err "no_equal_mark"		#则有提示，没有等号
+            continue
+        fi
+        key="${nextline%%=*}"		#删掉第一个 =，及其右边的字符串
+        value="${nextline#*=}"          #删掉第一个 =，及其左边的字符串
+	# grep -q 安静模式，不打印任何标准输出。如果有匹配的内容则立即返回状态值0。
+        echo "${key}" | grep -q "[^a-zA-Z_]" && my_err "invalid_char" && ret_val=1
+	# grep -qE 使用扩展正则表达式进行匹配，使用 grep –E 代替传统的扩展正则表达式 egrep
+	# 值不能存在空格和水平 tab
+        echo "${value}" | grep -qE "[[:space:]]" && my_err "value_have_space" && ret_val=1
+    # -v 显示不匹配的项，显示没有空格和水平tab的 env_file;grep -v '^$' ：命令的作用是过滤空白符
+    done < <(grep -vE "^[[:space:]]*#" "${env_file}" | grep -v "^$") #将整个while循环条件的输入指定为env_file变量定义的文件(先对env_file进行匹配过滤)
+    return ${ret_val}
+}
+
+#####################################
+#验证 procfile
+#参数 procfile 文件名
+#成功返回 0，失败返回 1
+#代码结构基本同 verify_env
+#####################################
+
+function verify_proc() {
+    local proc_file="$1"
+    local ret_val=0
+
+    [[ ! -f "${proc_file}" ]] && my_err "verify procfile not exists" && return 1
+
+    while read nextline ; do
+        if echo "${nextline}" | grep -v ":"; then
+            my_err "no_colon_command"
+            continue
+        fi
+        key="${nextline%%:*}"
+        value="${nextline#*:}"
+        echo "${key}" | grep -q [^a-zA-Z_] && my_err "invalid_char" && ret_val=1
+    done < <(grep -vE "^[[:space:]]*#" "${proc_file}")
+    return ${ret_val}
+}
+
+#####################################
+#显示错误信息
+#参数 提示错误信息内容
+#可以看见上面两个函数用到了
+#####################################
+
+function my_err() {
+    errinfo="$1"
+    echo "${errinfo}"
+}
+
+#####################################
+#显示日志
+#参数 进程运行命令，name，command，color
+#成功返回 0
+#####################################
+
+function log() {
+    local name="$1"
+    local command="$2"
+    local color="$3"
+    cur_time=$(date +%H:%M:%s)
+
+    printf "\E[${color}m${cur_time} %-7s] | " "${name}"			#颜色格式 red='\E[31;47m'
+
+    tput sgr0     # 去掉所有属性
+    echo "${command}"
+    return 0
+}
+
+#####################################
+#运行进程命令
+#参数 进程运行命令，name，command
+#成功返回 0
+#####################################
+
+function run_command() {
+    local proc_name="$1"	#进程名称
+    local command="$2"		#进程命令
+    local cur_pid=$!     # 代表最后执行的后台命令的PID
+    local cur_color="${COLOR_ARRAY[$NUMBER]}"
+    local comm_port=$(echo "${command}" | grep -e "\$PORT")	#命令端口
+
+    [[ -n "${comm_port}" ]] && [[ -z "${PORT}" ]] && PORT=8080		# comm_port 不是空，port是空的则port=8080
+    bash -c "${command}" > >(     			
+        while read result; do
+            log "${proc_name}" "${result}" "${cur_color}"
+        done
+    ) 2>&1 &		# 2>&1形式用于重定向，2>表示错误重定向，&1表示标准输出；"&"在Linux shell中表示后台运行
+
+    local output="$(eval echo \"${command}\")"   #重新运算，求出 command 运行后的结果
+    log "${proc_name}" "${output} start with pid ${cur_pid}" "${cur_color}" # 继续进行 log
+    [[ $? -ne 0 ]] && return 1  # log 成功打印
+
+    [[ -n "${comm_port}" ]] && PORT=$((${PORT} + 1))   #comm_port 不为空，端口号 + 1
+
+    (( NUMBER ++ ))   # 颜色变化
+
+    return 0
+}
+
+#####################################
+#遍历 envfile，并导入环境变量
+#参数 envfile 文件夹名
+#成功返回 0
+#####################################
+
+function load_env_file() {
+    set -a    # 标示已修改的变量，以供输出至环境变量。
+    local env_lists="$1"
+    for flag in $(echo "${env_lists}"); do		#读取 env 目录文件，并遍历文件
+        [[ -f "${flag}" ]] && source "${flag}"		#如果 flag 为常规文件，则在当前bash环境下读取并执行 flag 中的命令。
+    done
+    return 0
+}
+
+#####################################
+#运行 procfile 文件
+#参数 procfile 文件名
+#成功返回 0
+#####################################
+
+function run_procfile() {
+    local proc_file="$1"
+    [[ ! -f "${proc_file}" ]] && my_err "this procfile is not exists" && return 1	#文件存在与否
+    while read nextline; do				#从 done 后面读取文件内容，进行遍历
+        if echo "${nextline}" | grep -qv ":"; then	#如果此行没有 :，则错误
+            my_err "no_colon_command"
+            continue
+        fi
+        local key="${nextline%%:*}"		# 删掉第一个 :，及其右边的字符串
+        local value="${nextline#*:}"		# 删掉第一个 :，及其左边的字符串
+        [[ -n "${key}" ]] && [[ -n "${value}" ]] && run_command "${key}" "${value}"	#key，value 都不为空，运行命令
+        [[ $? -ne 0 ]] && return 1		#运行失败，返回 1
+    done < <(grep "" "${proc_file}" | grep -vE "[[:space:]]*#" | grep -v "^$" )
+					       #空格or水平tab             #空白字符
+    wait
+    return 0
+}
+
+#####################################
+#主程序
+#参数 传给脚本的所有参数的列表
+#####################################
+
+function main() {
+    local check=false
+    while getopts "f:e:ch" flag		  # flag = procfile，envfile
+    do
+        case ${flag} in
+            c) check=true ;;
+            f) procfile="${OPTARG}" ;;       # procfile 里面包含 f
+            e) envfile="${OPTARG}" ;;	     # envfile  里面包含 e
+            *) usage ;;
+        esac
+    done
+
+    if ${check}; then
+        if [[ -n "${procfile}" ]]; then
+            verify_proc "${procfile}"
+            PROC_RET_VALUE=$?
+            [[ ${PROC_RET_VALUE} -ne 0 ]] && exit 1     # if 来验证 procfile 是否合法
+        else
+            my_err "The procfile is null"
+            exit 1
+        fi
+
+        if [[ -z "${envfile}" ]];then	
+            envfile="./.env"			# 如果没有 envfile，则新增
+        fi
+        verify_env  "${envfile}"
+        ENV_RET_VALUE=$?
+        [[ ${ENV_RET_VALUE} -ne 0 ]] && exit 1    # 并验证 envfile 是否合法
+
+    else
+        if [[ -z "${envfile}" ]]; then
+            envfile="./.env"		# 如果没有 envfi，则新增
+        fi
+
+        load_env_file "${envfile}"	
+        LOAD_ENV_RET_VALUE=$?
+        [[ ${LOAD_ENV_RET_VALUE} -ne 0 ]] && exit 1    # 导入环境变量是否成功
+
+        if [[ -z "${procfile}" ]]; then
+            procfile="./Procfile"	# 如果没有 procfile，则新增
+        fi
+
+        run_procfile "${procfile}"
+        RUN_RET_VALUE=$?
+        [[ RUN_RET_VALUE -ne 0 ]] && exit 1	# procfile 运行是否成功
+    fi
+    exit 0
+} 
+
+main "$@"
